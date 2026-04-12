@@ -1,0 +1,68 @@
+{
+  "permissions": {
+    "allow": [
+      "Read",
+      "Write",
+      "Edit",
+      "MultiEdit",
+      "Glob",
+      "Grep",
+      "Bash",
+      "WebFetch",
+      "Web Search",
+      "Read(~/.claude/.credentials.json)",
+      "Edit(.claude/settings.json)",
+      "Edit(.claude/settings.local.json)",
+      "Write(.claude/settings.json)",
+      "Write(.claude/settings.local.json)",
+      "mcp__google-calendar__*",
+      "mcp__google-tasks__*"
+    ],
+    "ask": [
+      "mcp__google-calendar__delete-event",
+      "mcp__google-tasks__deleteTask",
+      "Bash(pip install *)",
+      "Bash(pip3 install *)",
+      "Bash(npm install *)",
+      "Bash(npm i *)",
+      "Bash(yarn add *)",
+      "Bash(pnpm add *)",
+      "Bash(cargo install *)",
+      "Bash(brew install *)",
+      "Bash(choco install *)",
+      "Bash(winget install *)",
+      "Bash(scoop install *)",
+      "Bash(rm -r *)",
+      "Bash(rmdir *)",
+      "Read(.env.*)"
+    ],
+
+    "deny": [
+      "Bash(rm -rf *)",
+      "Bash(rmdir /s *)",
+      "Bash(del /s *)",
+      "Bash(git push --force *)",
+      "Bash(git push -f *)",
+      "Bash(git reset --hard *)",
+      "Bash(git clean -fd *)",
+      "Bash(sudo *)",
+      "Bash(format *)",
+      "Bash(mkfs *)",
+      "Read(.env)",
+      "Read(**/.env)",
+      "Read(**/*.pem)",
+      "Read(**/*.key)",
+      "Read(**/*secret*)",
+      "Read(**/*credential*)",
+      "Read(~/.ssh/**)",
+      "Read(~/.aws/**)",
+      "Read(~/.gcp/**)",
+      "Read(~/.azure/**)",
+      "Read(gcp-oauth.keys.json)",
+      "Read(.google-refresh-token)"
+    ]
+  },
+  "env": {
+    "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"
+  }
+}
