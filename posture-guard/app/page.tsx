@@ -31,7 +31,6 @@ useEffect(() => {
   if (videoRef.current){
     videoRef.current.srcObject = stream; // ビデオ要素にカメラ映像をセット
     videoRef.current.onloadedmetadata = () => {
-      videoRef.current?.play(); // ビデオのメタデータが読み込まれたら再生開始
       detectPose(); // 姿勢検出を開始
     };
   }
