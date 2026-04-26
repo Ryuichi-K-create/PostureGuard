@@ -7,6 +7,8 @@ export default function Home() {
   const videoRef = useRef<HTMLVideoElement>(null); //<HTMLVideoElement> は「この入れ物はvideo要素を入れる」というTSの型指定
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
+  const latestLandmarksRef = useRef<any>(null); // 最新のランドマークを保持するためのref
+
 // MediaPipeとカメラの初期化・姿勢検出をする非同期処理
 useEffect(() => {
   let poseLandmarker: PoseLandmarker;
@@ -66,6 +68,8 @@ useEffect(() => {
       // キャンバスをクリアして前のフレームの描画を消す
       ctx.clearRect(0, 0, canvas.width, canvas.height);
 
+      latestLandmarksRef.current = results.landmarks[0]; // 最新のランドマークをrefに保存
+
       // 検出された全ランドマーク（人物1人分の33点の座標）をループ
       results.landmarks.forEach((landmark) => {
         // 1人分の全ランドマークについて、各点を描画
@@ -97,11 +101,40 @@ useEffect(() => {
 
 init();
 },[]);
+
+const calibrate = () => {
+  if (!latestLandmarksRef.current) return; // ランドマークがまだ検出されていない場合は処理を中止
+  const landmarks = latestLandmarksRef.current; // 最新のランドマークを取得
+  if (!landmarks) return; // ランドマークが存在しない場合は処理を中止
+
+  const leftEar = landmarks[7]; // 左耳のランドマーク（例: 7番目の点）
+  const rightEar = landmarks[8]; // 右耳のランドマーク（例: 8番目の点）
+
+  const earDist = Math.hypot(
+    leftEar.x - rightEar.x,
+    leftEar.y - rightEar.y
+  );
+
+  const leftEye = landmarks[1]; // 左目のランドマーク（例: 1番目の点）
+  const rightEye = landmarks[2]; // 右目のランドマーク（例: 2番目の点）
+  
+  const eyeDist = Math.hypot(
+    leftEye.x - rightEye.x,
+    leftEye.y - rightEye.y
+  );
+
+  console.log("耳の距離:", earDist);
+  console.log("目の距離:", eyeDist);
+};
   
   return (
     <div style={{position: "relative"}}>
       <video ref={videoRef} autoPlay playsInline />
       <canvas ref={canvasRef} style={{position: "absolute", top: 0, left: 0}} />
+
+      <button onClick={calibrate} style={{position: "absolute",top: 0,right: 100,padding: 8}}>
+        姿勢を記録
+      </button>
     </div>
   );
 }
