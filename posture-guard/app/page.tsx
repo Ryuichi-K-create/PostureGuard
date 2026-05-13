@@ -191,12 +191,23 @@ export default function Home() {
 
   // ── MediaPipe + カメラ初期化（マウント時1回）─────────────
   useEffect(() => {
-    let poseLandmarker: PoseLandmarker;
+    // クリーンアップで停止できるよう、リソース参照を useEffect スコープに保持する
+    // PoseLandmarker: WASMモデル(~7MB)。close()しないとメモリリーク
+    let poseLandmarker: PoseLandmarker | null = null;
+    // requestAnimationFrame の戻り値。cancelAnimationFrame に渡してループを止める
+    let rafId: number | null = null;
+    // React Strict Mode は dev で useEffect を2回走らせる(クリーンアップ忘れを検出するため)。
+    // 1回目のクリーンアップ後も async init が走り続けると、カメラ/モデル/rAFが二重化する。
+    // このフラグで「すでに中断された」ことを各 await の後にチェックする。
+    let cancelled = false;
 
     const init = async () => {
       const vision = await FilesetResolver.forVisionTasks(
         "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm"
       );
+      // await の後では cancelled になっている可能性がある(Strict Mode 2回目クリーンアップ)
+      if (cancelled) return;
+
       poseLandmarker = await PoseLandmarker.createFromOptions(vision, {
         baseOptions: {
           modelAssetPath:
@@ -205,18 +216,38 @@ export default function Home() {
         runningMode: "VIDEO",
         numPoses: 1,
       });
+      // ここでも cancelled チェック。確保したモデルは解放してから抜ける
+      if (cancelled) {
+        poseLandmarker.close();
+        poseLandmarker = null;
+        return;
+      }
 
-      const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+      // 解像度を 640x480 に制限。{ video: true } だとカメラ最大解像度(1080pや4K)で取得され、
+      // 毎フレームのGPU/CPU負荷が跳ねるため明示的に下げる。MediaPipeは内部でさらに縮小するので
+      // 姿勢推定の精度には影響しない。idealは「可能ならこの値、無理なら近い値」の意味。
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { width: { ideal: 640 }, height: { ideal: 480 } },
+      });
+      // 中断中に取れたストリームも明示的に止める。放置するとカメラランプが点きっぱなしになる
+      if (cancelled) {
+        stream.getTracks().forEach((t) => t.stop());
+        poseLandmarker?.close();
+        poseLandmarker = null;
+        return;
+      }
+
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
         videoRef.current.onloadedmetadata = () => {
-          detectPose();
+          // metadata 到着が遅れて cancelled 後になることもあるので最終チェック
+          if (!cancelled) detectPose();
         };
       }
     };
 
     const detectPose = () => {
-      if (!videoRef.current || !canvasRef.current) return;
+      if (!videoRef.current || !canvasRef.current || !poseLandmarker) return;
       const canvas = canvasRef.current;
       const ctx = canvas.getContext("2d");
       if (!ctx) return;
@@ -226,10 +257,13 @@ export default function Home() {
       canvas.height = videoRef.current.videoHeight;
 
       const detect = () => {
-        const results = poseLandmarker.detectForVideo(
-          videoRef.current!,
-          performance.now()
-        );
+        // cancelled 後やリソース解放後に走らないよう毎フレームガード。
+        // これを書かないと幽霊rAFループが続いてCPUを食い続ける
+        if (cancelled || !poseLandmarker) return;
+        const video = videoRef.current;
+        if (!video) return;
+
+        const results = poseLandmarker.detectForVideo(video, performance.now());
 
         ctx.clearRect(0, 0, canvas.width, canvas.height);
 
@@ -259,8 +293,8 @@ export default function Home() {
           }
         }
 
-        // 次フレームを予約。setIntervalと違い画面リフレッシュに同期するので滑らか
-        requestAnimationFrame(detect);
+        // 戻り値の id を保持してクリーンアップで cancelAnimationFrame に渡せるようにする
+        rafId = requestAnimationFrame(detect);
       };
 
       detect();
@@ -268,10 +302,16 @@ export default function Home() {
 
     init();
 
-    // クリーンアップ：コンポーネント破棄時にカメラを止める
+    // クリーンアップ：rAFループ停止 + カメラ停止 + WASMモデル解放
+    // これを全部やらないと、Strict Mode 二重実行や HMR(保存)のたびに資源が累積して
+    // 最終的に Node 側のメモリ枯渇や GPU 負荷増大につながる
     return () => {
+      cancelled = true;
+      if (rafId !== null) cancelAnimationFrame(rafId);
       const stream = videoRef.current?.srcObject as MediaStream | null;
       stream?.getTracks().forEach((t) => t.stop());
+      poseLandmarker?.close();
+      poseLandmarker = null;
     };
   }, []);
 
@@ -454,7 +494,7 @@ export default function Home() {
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-950 via-slate-900 to-slate-950 text-slate-100">
       {/* ─── ヘッダー ─── */}
-      <header className="border-b border-white/10 backdrop-blur-sm">
+      <header className="border-b border-white/10">
         <div className="max-w-7xl mx-auto px-6 py-4 flex items-center justify-between">
           <div className="flex items-center gap-3">
             {/* ロゴ代わりの簡易マーク */}
@@ -481,17 +521,18 @@ export default function Home() {
       {/* ─── メイン2カラム ─── */}
       <main className="max-w-7xl mx-auto px-6 py-6 grid gap-6 lg:grid-cols-[1fr_340px]">
         {/* ── 左：映像エリア ── */}
+        {/* 映像は素のピクセル等倍で表示。w-full で巨大化させると blur と相まって極端に重くなる */}
         <section className="space-y-4">
-          <div className="relative rounded-2xl overflow-hidden border border-white/10 bg-black shadow-2xl">
+          <div className="relative inline-block rounded-2xl overflow-hidden border border-white/10 bg-black shadow-2xl">
             <video
               ref={videoRef}
               autoPlay
               playsInline
-              className="w-full h-auto block scale-x-[-1] object-cover" 
+              className="block scale-x-[-1]"
             />
             <canvas
               ref={canvasRef}
-              className="absolute top-0 left-0 w-full h-full pointer-events-none scale-x-[-1]"
+              className="absolute top-0 left-0 pointer-events-none scale-x-[-1]"
             />
 
             {/* ステータスバッジ */}
@@ -511,7 +552,7 @@ export default function Home() {
 
             {/* ポモドーロ表示（有効時のみ・左下にオーバーレイ）*/}
             {settings.pomodoroEnabled && (
-              <div className="absolute bottom-3 left-3 px-3 py-2 rounded-lg bg-black/60 backdrop-blur border border-white/10">
+              <div className="absolute bottom-3 left-3 px-3 py-2 rounded-lg bg-black/80 border border-white/10">
                 <div className="text-[10px] uppercase tracking-wider text-slate-400">
                   {pomodoroPhase === "work" ? "作業中" : "休憩中"}
                 </div>
@@ -530,8 +571,8 @@ export default function Home() {
 
         {/* ── 右：サイドパネル ── */}
         <aside className="space-y-4">
-          {/* 統計カード */}
-          <div className="rounded-2xl border border-white/10 bg-white/5 p-5 backdrop-blur">
+          {/* 統計カード（backdrop-blurはGPU負荷源だったので除去。半透明だけ残す） */}
+          <div className="rounded-2xl border border-white/10 bg-white/5 p-5">
             <div className="flex items-center justify-between mb-3">
               <h2 className="font-bold">今日の崩れ</h2>
               <span className="text-xs text-slate-400">{stats.date}</span>
@@ -553,8 +594,8 @@ export default function Home() {
             </button>
           </div>
 
-          {/* 設定カード */}
-          <div className="rounded-2xl border border-white/10 bg-white/5 p-5 backdrop-blur space-y-3">
+          {/* 設定カード（backdrop-blur除去） */}
+          <div className="rounded-2xl border border-white/10 bg-white/5 p-5 space-y-3">
             <h2 className="font-bold mb-1">設定</h2>
 
             <ToggleRow
@@ -593,8 +634,8 @@ export default function Home() {
             </div>
           </div>
 
-          {/* 通知の状態カード */}
-          <div className="rounded-2xl border border-white/10 bg-white/5 p-5 backdrop-blur text-sm">
+          {/* 通知の状態カード（backdrop-blur除去） */}
+          <div className="rounded-2xl border border-white/10 bg-white/5 p-5 text-sm">
             <div className="flex items-center justify-between">
               <span className="text-slate-400">通知の許可</span>
               <span
