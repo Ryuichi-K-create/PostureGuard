@@ -36,7 +36,6 @@ type Sensitivity = "ゆるめ" | "普通" | "厳しめ";
 // ユーザー設定（localStorageに保存）
 type Settings = {
   soundEnabled: boolean;        // ビープ音を鳴らすか
-  notificationEnabled: boolean; // デスクトップ通知を出すか
   sensitivity: Sensitivity;     // 検出感度
   pomodoroEnabled: boolean;     // ポモドーロタイマーを使うか
   mosaicEnabled: boolean;       // 背景を自動でモザイク化するか（プライバシー保護）
@@ -78,7 +77,6 @@ const SENSITIVITY_TABLE: Record<Sensitivity, { nose: number; ear: number; should
 // 設定のデフォルト値（localStorageに何もないときに使う）
 const DEFAULT_SETTINGS: Settings = {
   soundEnabled: true,
-  notificationEnabled: true,
   sensitivity: "普通",
   pomodoroEnabled: false,
   mosaicEnabled: false, // 初期は無効（処理コストがあるのでユーザー選択制）
@@ -248,8 +246,8 @@ export default function Home() {
   // 崩れが始まった時刻（ms）。OKに戻ったらnullに戻す
   const issueStartRef = useRef<number | null>(null);
 
-  // アラート再生中フラグ。多重再生防止
-  const alertingRef = useRef<boolean>(false);
+  // 最後にアラートを出した時刻（ms）。nullは未発報。5秒ごとに繰り返すために使う
+  const lastAlertTimeRef = useRef<number | null>(null);
 
   // UI表示用のstate（毎フレームではなく状態が変わったときだけ更新）
   const [status, setStatus] = useState<PostureIssue>("ok");
@@ -278,8 +276,11 @@ export default function Home() {
   const [pomodoroPhase, setPomodoroPhase] = useState<PomodoroPhase>("work");
   const [pomodoroRemainingMs, setPomodoroRemainingMs] = useState<number>(POMODORO_WORK_MS);
 
-  // ブラウザ通知の許可状態（"default" | "granted" | "denied"）
-  const [notifPermission, setNotifPermission] = useState<NotificationPermission>("default");
+  // カメラの起動/停止状態（true=映像取得中 / false=停止中）
+  // OFFにするとカメラランプが消えて他アプリでカメラを使えるようになる
+  const [cameraActive, setCameraActive] = useState<boolean>(true);
+  // detectループ内のクロージャから最新値を見るためのrefミラー
+  const cameraActiveRef = useRef<boolean>(true);
 
   // キャリブレーション直後のフィードバック表示
   // null=非表示 / "success"=記録成功 / "no-landmark"=骨格未検出で失敗
@@ -390,10 +391,6 @@ export default function Home() {
       // 壊れていたら無視
     }
 
-    // 通知の許可状態を初期反映
-    if (typeof window !== "undefined" && "Notification" in window) {
-      setNotifPermission(Notification.permission);
-    }
   }, []);
 
   // ── settings 変更時：localStorageに保存 + refにミラー ────
@@ -592,6 +589,15 @@ export default function Home() {
         const video = videoRef.current;
         if (!video) return;
 
+        // カメラがOFFのとき（srcObject=null）：canvasをクリアしてループだけ継続する。
+        // OFFのまま detectForVideo を呼ぶと videoWidth=0 で内部エラーになるため先に弾く。
+        if (!cameraActiveRef.current || !video.srcObject) {
+          ctx.clearRect(0, 0, canvas.width, canvas.height);
+          const frameWinOff = canvas.ownerDocument.defaultView ?? window;
+          rafId = frameWinOff.requestAnimationFrame(detect);
+          return;
+        }
+
         const results = poseLandmarker.detectForVideo(video, performance.now());
 
         ctx.clearRect(0, 0, canvas.width, canvas.height);
@@ -697,12 +703,6 @@ export default function Home() {
     setPomodoroPhase(next);
     setPomodoroRemainingMs(next === "break" ? POMODORO_BREAK_MS : POMODORO_WORK_MS);
 
-    // フェーズが切り替わるタイミングで通知＋ビープ
-    if (next === "break") {
-      sendNotification("休憩しましょう", "5分間目と肩を休めてください");
-    } else {
-      sendNotification("作業を再開しましょう", "25分集中していきましょう");
-    }
     if (settingsRef.current.soundEnabled) playBeep();
   }, [pomodoroRemainingMs, pomodoroPhase, settings.pomodoroEnabled]);
 
@@ -744,34 +744,34 @@ export default function Home() {
     return "ok";
   };
 
-  // ── 崩れ状態の継続を時間で管理し、5秒継続でアラート ────
+  // ── 崩れ状態の継続を時間で管理し、5秒ごとにアラートを繰り返す ────
   const handleIssue = (issue: PostureIssue) => {
     if (issue === "ok") {
       issueStartRef.current = null;
-      alertingRef.current = false;
+      lastAlertTimeRef.current = null;
       setStatus((prev) => (prev === "ok" ? prev : "ok"));
       return;
     }
 
     setStatus((prev) => (prev === issue ? prev : issue));
 
+    const now = performance.now();
+
     if (issueStartRef.current === null) {
-      issueStartRef.current = performance.now();
+      issueStartRef.current = now;
       return;
     }
 
-    const elapsed = performance.now() - issueStartRef.current;
-    if (elapsed > ALERT_DELAY_MS && !alertingRef.current) {
-      alertingRef.current = true;
+    const elapsed = now - issueStartRef.current;
+    // 前回のアラートからの経過時間（初回はInfinityとして扱い必ず発報）
+    const sinceLastAlert = lastAlertTimeRef.current === null
+      ? Infinity
+      : now - lastAlertTimeRef.current;
 
-      // 設定に応じて音と通知を出す
+    if (elapsed > ALERT_DELAY_MS && sinceLastAlert >= ALERT_DELAY_MS) {
+      lastAlertTimeRef.current = now;
+
       if (settingsRef.current.soundEnabled) playBeep();
-      if (settingsRef.current.notificationEnabled) {
-        sendNotification(
-          "姿勢が崩れています",
-          `${issue}を検出しました。背筋を伸ばしましょう。`
-        );
-      }
 
       // 履歴に1件加算（種類別カウントを保持・表示時に合算）
       setHistory((prev) => {
@@ -804,23 +804,37 @@ export default function Home() {
     osc.stop(ctx.currentTime + 0.5);
   };
 
-  // ── デスクトップ通知（許可済みのときだけ）──────────────
-  const sendNotification = (title: string, body: string) => {
-    if (typeof window === "undefined") return;
-    if (!("Notification" in window)) return;
-    if (Notification.permission !== "granted") return;
-    try {
-      new Notification(title, { body, icon: "/favicon.ico" });
-    } catch {
-      // モバイル等で new Notification が禁止されている場合は黙って無視
-    }　　　　
+  // ── cameraActive の state→ref ミラー ─────────────────────
+  // detectループはクロージャで初回マウント時の値を掴んでいるため、
+  // refを介さないと最新のON/OFF状態が伝わらない（settingsRefと同じパターン）
+  useEffect(() => {
+    cameraActiveRef.current = cameraActive;
+  }, [cameraActive]);
+
+  // ── カメラを停止する ─────────────────────────────────────
+  // getTracks().stop() が「カメラランプを消す」唯一の方法。
+  // srcObject = null だけではストリームは解放されず、OSレベルでカメラが占有されたまま。
+  const stopCamera = () => {
+    const stream = videoRef.current?.srcObject as MediaStream | null;
+    stream?.getTracks().forEach((t) => t.stop());
+    if (videoRef.current) videoRef.current.srcObject = null;
+    setCameraActive(false);
   };
 
-  // ── 通知許可をリクエスト（ボタンから呼ぶ）──────────────
-  const requestNotifPermission = async () => {
-    if (typeof window === "undefined" || !("Notification" in window)) return;
-    const result = await Notification.requestPermission();
-    setNotifPermission(result);
+  // ── カメラを再起動する ───────────────────────────────────
+  // getUserMedia は毎回ユーザー許可を確認する（2回目以降はブラウザが自動で許可）
+  // 他アプリがカメラを解放していなければ OverconstrainedError / NotReadableError が出る
+  const startCamera = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { width: { ideal: 640 }, height: { ideal: 480 } },
+      });
+      if (videoRef.current) videoRef.current.srcObject = stream;
+      setCameraActive(true);
+    } catch {
+      // Zoomなど他アプリが使用中のまま起動しようとした場合は黙って無視する
+      // ユーザーは他アプリを閉じてから再度ボタンを押すことで解決できる
+    }
   };
 
   // ── 「姿勢を記録」ボタンで基準値を保存 ─────────────────
@@ -847,7 +861,7 @@ export default function Home() {
     baselineRef.current = baseline;
     setCalibrated(true);
     issueStartRef.current = null;
-    alertingRef.current = false;
+    lastAlertTimeRef.current = null;
 
     // 再読み込み後も基準値を維持するためlocalStorageに保存
     try {
@@ -872,7 +886,7 @@ export default function Home() {
     setIsStarted(false);
     setStatus("ok");
     issueStartRef.current = null;
-    alertingRef.current = false;
+    lastAlertTimeRef.current = null;
     // PiPを閉じる処理は上のuseEffect（isStarted→false検知）が担当
   };
 
@@ -1088,10 +1102,14 @@ export default function Home() {
 
   // ── 派生値（UI表示）────────────────────────────────────
   // ステータスバッジの色
+  // ステータスバッジの色
+  // 優先順位: 未監視(カメラOFF) > 崩れ中 > 良好
   const statusColor =
-    status === "ok"
-      ? "bg-emerald-500/90"
-      : "bg-red-500/90 animate-pulse";
+    !cameraActive
+      ? "bg-slate-500/90"                  // グレー：カメラが止まっていて判定していない
+      : status !== "ok"
+      ? "bg-red-500/90 animate-pulse"      // 赤脈動：崩れ検出中
+      : "bg-emerald-500/90";               // 緑：良好
 
   // 今日のレコード（無ければ空）
   const todayRecord: DailyRecord = history[todayKey()] ?? emptyDailyRecord();
@@ -1123,15 +1141,22 @@ export default function Home() {
             </div>
           </div>
           <div className="flex items-center gap-2">
-            {/* 通知許可ボタン（未許可のときだけ表示）*/}
-            {notifPermission !== "granted" && (
-              <button
-                onClick={requestNotifPermission}
-                className="text-xs px-3 py-1.5 rounded-md bg-white/10 hover:bg-white/20 transition border border-white/10"
-              >
-                通知を許可する
-              </button>
-            )}
+            {/* カメラON/OFFボタン
+                OFF中は赤系、ON中はデフォルト色。押すたびに stopCamera/startCamera を呼ぶ */}
+            <button
+              onClick={cameraActive ? stopCamera : startCamera}
+              className={`text-xs px-3 py-1.5 rounded-md transition border flex items-center gap-1.5 ${
+                cameraActive
+                  ? "bg-white/10 hover:bg-white/20 border-white/10 text-slate-200"
+                  : "bg-red-500/20 hover:bg-red-500/30 border-red-500/30 text-red-300"
+              }`}
+            >
+              {/* ● で状態を視覚的に示す：緑=撮影中 / 赤点滅=停止中 */}
+              <span className={cameraActive ? "text-emerald-400" : "text-red-400 animate-pulse"}>
+                ●
+              </span>
+              {cameraActive ? "カメラ停止" : "カメラ起動"}
+            </button>
           </div>
         </div>
       </header>
@@ -1183,7 +1208,11 @@ export default function Home() {
             <div
               className={`absolute top-3 left-3 px-3 py-1.5 rounded-full text-sm font-bold shadow-lg ${statusColor}`}
             >
-              {calibrated ? `状態: ${status === "ok" ? "良好" : status}` : "未キャリブレーション"}
+              {!cameraActive
+                ? "状態: 未監視"
+                : calibrated
+                ? `状態: ${status === "ok" ? "良好" : status}`
+                : "未キャリブレーション"}
             </div>
 
             {/* キャリブレーションボタン
@@ -1196,6 +1225,15 @@ export default function Home() {
               >
                 姿勢を記録 (Space)
               </button>
+            )}
+
+            {/* カメラ停止中オーバーレイ：停止中は映像エリア全体を暗くして「停止中」を表示 */}
+            {!cameraActive && (
+              <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/70 gap-3">
+                <span className="text-4xl text-red-400 animate-pulse">●</span>
+                <p className="text-sm font-bold text-slate-200">カメラ停止中</p>
+                <p className="text-xs text-slate-400">他のアプリでカメラを使えます</p>
+              </div>
             )}
 
             {/* キャリブレーション結果のフィードバック（中央オーバーレイ）
@@ -1264,7 +1302,7 @@ export default function Home() {
                     }`}
                   />
                   <span className="truncate font-medium">
-                    {calibrated ? (status === "ok" ? "姿勢OK" : status) : "未キャリブレーション"}
+                    {!cameraActive ? "未監視" : calibrated ? (status === "ok" ? "姿勢OK" : status) : "未キャリブレーション"}
                   </span>
                 </div>
                 <div className="flex gap-1 rounded-md bg-black/40 border border-white/10 p-0.5 text-[10px] shrink-0">
@@ -1362,11 +1400,6 @@ export default function Home() {
               onChange={(v) => setSettings((s) => ({ ...s, soundEnabled: v }))}
             />
             <ToggleRow
-              label="デスクトップ通知"
-              checked={settings.notificationEnabled}
-              onChange={(v) => setSettings((s) => ({ ...s, notificationEnabled: v }))}
-            />
-            <ToggleRow
               label="ポモドーロ (25/5分)"
               checked={settings.pomodoroEnabled}
               onChange={(v) => setSettings((s) => ({ ...s, pomodoroEnabled: v }))}
@@ -1393,21 +1426,6 @@ export default function Home() {
                   </button>
                 ))}
               </div>
-            </div>
-            {/* 通知許可の状態インライン表示 */}
-            <div className="flex items-center justify-between pt-1 text-sm">
-              <span className="text-slate-400">通知の許可</span>
-              <span
-                className={`px-2 py-0.5 rounded-full text-xs ${
-                  notifPermission === "granted"
-                    ? "bg-emerald-500/20 text-emerald-300"
-                    : notifPermission === "denied"
-                    ? "bg-red-500/20 text-red-300"
-                    : "bg-slate-500/20 text-slate-300"
-                }`}
-              >
-                {notifPermission === "granted" ? "許可済み" : notifPermission === "denied" ? "ブロック" : "未設定"}
-              </span>
             </div>
           </div>
 
