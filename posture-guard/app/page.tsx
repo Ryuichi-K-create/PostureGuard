@@ -7,6 +7,16 @@
 import { useEffect, useRef, useState } from "react";
 // MediaPipe の Pose Landmarker（骨格検出）と WASM ローダー
 import { PoseLandmarker, FilesetResolver } from "@mediapipe/tasks-vision";
+// Recharts：履歴グラフ用
+import {
+  BarChart,
+  Bar,
+  XAxis,
+  YAxis,
+  Tooltip,
+  ResponsiveContainer,
+  CartesianGrid,
+} from "recharts";
 
 // ─── 型定義 ───────────────────────────────────────────────
 
@@ -33,11 +43,23 @@ type Settings = {
   mosaicEnabled: boolean;       // 背景を自動でモザイク化するか（プライバシー保護）
 };
 
-// 1日分の崩れ統計（日付が変わったらリセットする）
-type Stats = {
-  date: string;                              // "YYYY-MM-DD"
-  count: Record<Exclude<PostureIssue, "ok">, number>; // 種類別カウント
+// 旧形式：1日分の統計（移行用にだけ残す）
+type LegacyStats = {
+  date: string;
+  count: Record<Exclude<PostureIssue, "ok">, number>;
 };
+
+// 1日分の記録：種類別カウント + 動作時間
+type DailyRecord = {
+  count: Record<Exclude<PostureIssue, "ok">, number>;
+  uptimeMs: number; // キャリブ後 ＆ 骨格検出中の累計ミリ秒
+};
+
+// 履歴：日付("YYYY-MM-DD")をキーにしたマップ（無限に貯める）
+type History = Record<string, DailyRecord>;
+
+// 履歴表示の期間切替
+type Period = "7days" | "30days" | "90days" | "all";
 
 // ポモドーロのフェーズ
 type PomodoroPhase = "work" | "break";
@@ -80,7 +102,20 @@ const PIP_MINIMIZED_SIZE = { width: 240, height: 50 };
 
 // localStorage のキー
 const LS_SETTINGS = "postureguard.settings.v1";
-const LS_STATS = "postureguard.stats.v1";
+const LS_STATS = "postureguard.stats.v1";       // 旧キー（移行用に読み込みのみ）
+const LS_HISTORY = "postureguard.history.v1";   // 新キー：日付ごとのDailyRecord
+
+// 動作時間のフラッシュ間隔（refで貯めて、この間隔でstate/localStorageへ反映）
+const UPTIME_FLUSH_MS = 2000;
+// 1フレームdtの最大ガード値。タブ復帰直後の巨大差分（>1秒）は加算しない
+const FRAME_DT_MAX = 1000;
+// 期間ラベル
+const PERIOD_LABELS: Record<Period, string> = {
+  "7days": "7日",
+  "30days": "30日",
+  "90days": "90日",
+  "all": "全期間",
+};
 
 // ─── ヘルパー ─────────────────────────────────────────────
 
@@ -93,11 +128,92 @@ const todayKey = (): string => {
   return `${yyyy}-${mm}-${dd}`;
 };
 
-// 空の日次統計を作る
-const emptyStats = (): Stats => ({
-  date: todayKey(),
+// 空の日次レコードを作る
+const emptyDailyRecord = (): DailyRecord => ({
   count: { "うつむき": 0, "前のめり": 0, "肩崩れ": 0 },
+  uptimeMs: 0,
 });
+
+// 履歴に今日のキーが無ければ初期化して返す（破壊的ではなく新オブジェクト）
+const ensureDay = (h: History, day: string): History => {
+  if (h[day]) return h;
+  return { ...h, [day]: emptyDailyRecord() };
+};
+
+// 1日分の合計回数（種類を合算）
+const dailyTotal = (r: DailyRecord): number =>
+  r.count["うつむき"] + r.count["前のめり"] + r.count["肩崩れ"];
+
+// 旧形式LegacyStatsを新形式Historyへ変換（移行用）
+const migrateLegacy = (legacy: LegacyStats): History => ({
+  [legacy.date]: { count: legacy.count, uptimeMs: 0 },
+});
+
+// 日付文字列を Date に戻す（タイムゾーン依存）
+const parseDateKey = (key: string): Date => {
+  const [y, m, d] = key.split("-").map(Number);
+  return new Date(y, m - 1, d);
+};
+
+// Date を "YYYY-MM-DD" 形式に
+const formatDateKey = (d: Date): string => {
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}`;
+};
+
+// 期間→日数（"all"はnull）
+const periodToDays = (p: Period): number | null => {
+  if (p === "7days") return 7;
+  if (p === "30days") return 30;
+  if (p === "90days") return 90;
+  return null;
+};
+
+// グラフ描画用のデータ配列を作る
+// - 期間が"all"なら履歴にある日付だけ
+// - それ以外は今日から N 日前まで全日を埋める（空欄日は0）
+type ChartRow = {
+  date: string;      // "YYYY-MM-DD"
+  label: string;     // "5/14" のような短縮形（XAxis用）
+  total: number;     // 崩れ合計回数
+  uptimeHours: number;
+  rate: number;      // 回数/時間（動作時間0のときは0）
+};
+
+const buildChartData = (h: History, period: Period): ChartRow[] => {
+  const days = periodToDays(period);
+  const toRow = (key: string, rec: DailyRecord): ChartRow => {
+    const total = dailyTotal(rec);
+    const uptimeHours = rec.uptimeMs / 3_600_000;
+    return {
+      date: key,
+      label: `${parseDateKey(key).getMonth() + 1}/${parseDateKey(key).getDate()}`,
+      total,
+      uptimeHours,
+      rate: uptimeHours > 0 ? total / uptimeHours : 0,
+    };
+  };
+
+  if (days === null) {
+    // 全期間：履歴にある日付だけソートして
+    return Object.keys(h)
+      .sort()
+      .map((key) => toRow(key, h[key]));
+  }
+
+  // N日：今日から N-1 日前まで埋める
+  const rows: ChartRow[] = [];
+  const now = new Date();
+  for (let i = days - 1; i >= 0; i--) {
+    const d = new Date(now);
+    d.setDate(d.getDate() - i);
+    const key = formatDateKey(d);
+    rows.push(toRow(key, h[key] ?? emptyDailyRecord()));
+  }
+  return rows;
+};
 
 // ms を "MM:SS" にフォーマット（ポモドーロ表示用）
 const formatMmSs = (ms: number): string => {
@@ -105,6 +221,15 @@ const formatMmSs = (ms: number): string => {
   const m = String(Math.floor(totalSec / 60)).padStart(2, "0");
   const s = String(totalSec % 60).padStart(2, "0");
   return `${m}:${s}`;
+};
+
+// ms を "Xh Ym" にフォーマット（動作時間表示用）
+const formatHm = (ms: number): string => {
+  const totalMin = Math.floor(ms / 60_000);
+  const h = Math.floor(totalMin / 60);
+  const m = totalMin % 60;
+  if (h === 0) return `${m}分`;
+  return `${h}時間${m}分`;
 };
 
 // ─── コンポーネント ───────────────────────────────────────
@@ -136,8 +261,17 @@ export default function Home() {
   // 設定の最新値をrefにミラーする：detectPose内のクロージャから最新設定を見るため
   const settingsRef = useRef<Settings>(DEFAULT_SETTINGS);
 
-  // 1日分の崩れ統計
-  const [stats, setStats] = useState<Stats>(emptyStats);
+  // 履歴：日付ごとのDailyRecordマップ（無限に貯める）
+  const [history, setHistory] = useState<History>({});
+
+  // 履歴グラフの期間切替
+  const [historyPeriod, setHistoryPeriod] = useState<Period>("30days");
+
+  // 動作時間トラッキング用
+  // 前フレームの performance.now()。差分計算に使う
+  const lastFrameTimeRef = useRef<number | null>(null);
+  // フレームごとに加算するバッファ。UPTIME_FLUSH_MS ごとに state へ反映
+  const pendingUptimeMsRef = useRef<number>(0);
 
   // ポモドーロ：現在のフェーズ（作業 or 休憩）と残り時間ms
   const [pomodoroPhase, setPomodoroPhase] = useState<PomodoroPhase>("work");
@@ -212,15 +346,21 @@ export default function Home() {
       // 壊れていたら無視してデフォルトのまま
     }
 
-    // 統計の復元（日付が違ったら今日分にリセット）
+    // 履歴の復元（新キー優先、無ければ旧キーから移行）
     try {
-      const raw = localStorage.getItem(LS_STATS);
-      if (raw) {
-        const parsed = JSON.parse(raw) as Stats;
-        if (parsed.date === todayKey()) {
-          setStats(parsed);
-        } else {
-          setStats(emptyStats());
+      const rawHistory = localStorage.getItem(LS_HISTORY);
+      if (rawHistory) {
+        const parsed = JSON.parse(rawHistory) as History;
+        setHistory(parsed);
+      } else {
+        // 旧 LS_STATS があれば移行
+        const rawLegacy = localStorage.getItem(LS_STATS);
+        if (rawLegacy) {
+          const legacy = JSON.parse(rawLegacy) as LegacyStats;
+          const migrated = migrateLegacy(legacy);
+          setHistory(migrated);
+          localStorage.setItem(LS_HISTORY, JSON.stringify(migrated));
+          localStorage.removeItem(LS_STATS);
         }
       }
     } catch {
@@ -243,14 +383,34 @@ export default function Home() {
     }
   }, [settings]);
 
-  // ── stats 変更時：localStorageに保存 ─────────────────────
+  // ── history 変更時：localStorageに保存 ───────────────────
   useEffect(() => {
     try {
-      localStorage.setItem(LS_STATS, JSON.stringify(stats));
+      localStorage.setItem(LS_HISTORY, JSON.stringify(history));
     } catch {
       // 同上
     }
-  }, [stats]);
+  }, [history]);
+
+  // ── 動作時間のフラッシュ：refに貯めた dt を state に反映 ────
+  // 毎フレームsetStateすると再レンダリングが重いので、2秒ごとにまとめて反映
+  useEffect(() => {
+    const id = window.setInterval(() => {
+      const pending = pendingUptimeMsRef.current;
+      if (pending <= 0) return;
+      pendingUptimeMsRef.current = 0;
+
+      setHistory((prev) => {
+        const day = todayKey();
+        const ensured = ensureDay(prev, day);
+        return {
+          ...ensured,
+          [day]: { ...ensured[day], uptimeMs: ensured[day].uptimeMs + pending },
+        };
+      });
+    }, UPTIME_FLUSH_MS);
+    return () => window.clearInterval(id);
+  }, []);
 
   // ── MediaPipe + カメラ初期化（マウント時1回）─────────────
   useEffect(() => {
@@ -426,6 +586,24 @@ export default function Home() {
         const landmarks = results.landmarks[0];
         latestLandmarksRef.current = landmarks ?? null;
 
+        // ── 動作時間の計測 ──
+        // キャリブ後 & 骨格検出中 のフレームだけ、前フレームからの差分を加算
+        // タブ離脱中は rAF 自体が止まるので、ここで明示的に止める必要は無い
+        const nowTs = performance.now();
+        const prevTs = lastFrameTimeRef.current;
+        lastFrameTimeRef.current = nowTs;
+        if (
+          prevTs !== null &&
+          baselineRef.current &&
+          landmarks
+        ) {
+          const dt = nowTs - prevTs;
+          // 復帰直後などの巨大差分はガード（外れ値を弾く）
+          if (dt > 0 && dt < FRAME_DT_MAX) {
+            pendingUptimeMsRef.current += dt;
+          }
+        }
+
         // 骨格描画（点だけシンプルに）
         if (landmarks) {
           landmarks.forEach((point) => {
@@ -571,13 +749,17 @@ export default function Home() {
         );
       }
 
-      // 統計に1件加算（関数形式で前の値を確実に取る）
-      setStats((prev) => {
-        // 日付が変わっていたら今日分にリセットしてから加算
-        const base = prev.date === todayKey() ? prev : emptyStats();
+      // 履歴に1件加算（種類別カウントを保持・表示時に合算）
+      setHistory((prev) => {
+        const day = todayKey();
+        const ensured = ensureDay(prev, day);
+        const cur = ensured[day];
         return {
-          ...base,
-          count: { ...base.count, [issue]: base.count[issue] + 1 },
+          ...ensured,
+          [day]: {
+            ...cur,
+            count: { ...cur.count, [issue]: cur.count[issue] + 1 },
+          },
         };
       });
     }
@@ -866,9 +1048,19 @@ export default function Home() {
       ? "bg-emerald-500/90"
       : "bg-red-500/90 animate-pulse";
 
+  // 今日のレコード（無ければ空）
+  const todayRecord: DailyRecord = history[todayKey()] ?? emptyDailyRecord();
+
   // 今日の崩れ合計回数
-  const totalIssues =
-    stats.count["うつむき"] + stats.count["前のめり"] + stats.count["肩崩れ"];
+  const totalIssues = dailyTotal(todayRecord);
+
+  // 履歴グラフ用のデータ（期間切替に応じて）
+  const chartData = buildChartData(history, historyPeriod);
+
+  // 期間内サマリ（合計回数・合計動作時間・平均レート）
+  const periodTotalCount = chartData.reduce((s, r) => s + r.total, 0);
+  const periodTotalHours = chartData.reduce((s, r) => s + r.uptimeHours, 0);
+  const periodAvgRate = periodTotalHours > 0 ? periodTotalCount / periodTotalHours : 0;
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-950 via-slate-900 to-slate-950 text-slate-100">
@@ -1058,27 +1250,128 @@ export default function Home() {
 
         {/* ── 右：サイドパネル ── */}
         <aside className="space-y-4">
-          {/* 統計カード（backdrop-blurはGPU負荷源だったので除去。半透明だけ残す） */}
+          {/* 統計カード：今日の崩れ（種類別表示は維持） */}
           <div className="rounded-2xl border border-white/10 bg-white/5 p-5">
             <div className="flex items-center justify-between mb-3">
               <h2 className="font-bold">今日の崩れ</h2>
-              <span className="text-xs text-slate-400">{stats.date}</span>
+              <span className="text-xs text-slate-400">{todayKey()}</span>
             </div>
-            <div className="text-4xl font-bold mb-3">
-              {totalIssues}
-              <span className="text-sm font-normal text-slate-400 ml-1">回</span>
+            <div className="flex items-baseline gap-4 mb-3">
+              <div className="text-4xl font-bold">
+                {totalIssues}
+                <span className="text-sm font-normal text-slate-400 ml-1">回</span>
+              </div>
+              <div className="text-xs text-slate-400">
+                動作 <span className="text-slate-200 font-semibold">{formatHm(todayRecord.uptimeMs)}</span>
+                {todayRecord.uptimeMs > 0 && (
+                  <span className="ml-2">
+                    （<span className="text-slate-200 font-semibold">
+                      {(totalIssues / (todayRecord.uptimeMs / 3_600_000)).toFixed(1)}
+                    </span>
+                    <span className="text-slate-400">回/時</span>）
+                  </span>
+                )}
+              </div>
             </div>
             <div className="space-y-1.5 text-sm">
-              <StatRow label="うつむき" value={stats.count["うつむき"]} color="bg-amber-400" />
-              <StatRow label="前のめり" value={stats.count["前のめり"]} color="bg-pink-400" />
-              <StatRow label="肩崩れ" value={stats.count["肩崩れ"]} color="bg-cyan-400" />
+              <StatRow label="うつむき" value={todayRecord.count["うつむき"]} color="bg-amber-400" />
+              <StatRow label="前のめり" value={todayRecord.count["前のめり"]} color="bg-pink-400" />
+              <StatRow label="肩崩れ" value={todayRecord.count["肩崩れ"]} color="bg-cyan-400" />
             </div>
             <button
-              onClick={() => setStats(emptyStats())}
+              onClick={() =>
+                setHistory((prev) => ({ ...prev, [todayKey()]: emptyDailyRecord() }))
+              }
               className="mt-4 text-xs text-slate-400 hover:text-slate-200 transition"
             >
-              リセット
+              今日をリセット
             </button>
+          </div>
+
+          {/* 履歴カード：期間切替トグル + 棒グラフ + サマリ */}
+          <div className="rounded-2xl border border-white/10 bg-white/5 p-5">
+            <div className="flex items-center justify-between mb-3">
+              <h2 className="font-bold">履歴</h2>
+              <div className="flex gap-1 rounded-lg bg-black/30 p-0.5">
+                {(["7days", "30days", "90days", "all"] as Period[]).map((p) => (
+                  <button
+                    key={p}
+                    onClick={() => setHistoryPeriod(p)}
+                    className={`text-[10px] px-2 py-1 rounded-md transition ${
+                      historyPeriod === p
+                        ? "bg-white text-slate-900 font-bold"
+                        : "text-slate-300 hover:bg-white/10"
+                    }`}
+                  >
+                    {PERIOD_LABELS[p]}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* サマリ：合計回数・動作時間・崩れ率 */}
+            <div className="grid grid-cols-3 gap-2 mb-3 text-center">
+              <div className="rounded-lg bg-black/30 p-2">
+                <div className="text-[10px] text-slate-400">合計</div>
+                <div className="font-bold text-slate-100 tabular-nums">
+                  {periodTotalCount}<span className="text-[10px] text-slate-400 ml-0.5">回</span>
+                </div>
+              </div>
+              <div className="rounded-lg bg-black/30 p-2">
+                <div className="text-[10px] text-slate-400">動作時間</div>
+                <div className="font-bold text-slate-100 tabular-nums">
+                  {formatHm(periodTotalHours * 3_600_000)}
+                </div>
+              </div>
+              <div className="rounded-lg bg-black/30 p-2">
+                <div className="text-[10px] text-slate-400">崩れ率</div>
+                <div className="font-bold text-slate-100 tabular-nums">
+                  {periodAvgRate.toFixed(1)}<span className="text-[10px] text-slate-400 ml-0.5">回/時</span>
+                </div>
+              </div>
+            </div>
+
+            {/* 棒グラフ：x=日付 / y=回数/時間（崩れ率）。0時間の日は0で表示 */}
+            <div className="w-full h-48">
+              {chartData.length === 0 ? (
+                <div className="h-full flex items-center justify-center text-xs text-slate-500">
+                  まだ履歴がありません
+                </div>
+              ) : (
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart data={chartData} margin={{ top: 8, right: 8, left: -20, bottom: 0 }}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#ffffff10" />
+                    <XAxis
+                      dataKey="label"
+                      tick={{ fill: "#94a3b8", fontSize: 10 }}
+                      interval="preserveStartEnd"
+                    />
+                    <YAxis tick={{ fill: "#94a3b8", fontSize: 10 }} />
+                    <Tooltip
+                      contentStyle={{
+                        background: "#0f172a",
+                        border: "1px solid #334155",
+                        borderRadius: 8,
+                        fontSize: 12,
+                      }}
+                      labelStyle={{ color: "#e2e8f0" }}
+                      formatter={(value, _name, item) => {
+                        const row = (item as { payload?: ChartRow }).payload;
+                        if (!row) return [String(value), "回/時"];
+                        return [
+                          `${row.rate.toFixed(1)}回/時（合計${row.total}回 / ${formatHm(row.uptimeHours * 3_600_000)}）`,
+                          "崩れ率",
+                        ];
+                      }}
+                    />
+                    <Bar dataKey="rate" fill="#34d399" radius={[4, 4, 0, 0]} />
+                  </BarChart>
+                </ResponsiveContainer>
+              )}
+            </div>
+            <div className="mt-2 text-[10px] text-slate-500">
+              縦軸: 1時間あたりの崩れ回数（動作時間で正規化）
+            </div>
           </div>
 
           {/* 設定カード（backdrop-blur除去） */}
