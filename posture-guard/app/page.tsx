@@ -30,6 +30,11 @@ type Baseline = {
 // 検出される崩れの種類（"ok" は崩れていない状態）
 type PostureIssue = "ok" | "うつむき" | "前のめり" | "肩崩れ";
 
+// UI表示用のステータス：崩れの種類 + 骨格が取れていない「未検出」
+// 判定ロジック(judgePosture)は PostureIssue を返すが、骨格そのものが見えない状態は
+// 判定の外側で扱いたいので、UI state だけ拡張する
+type Status = PostureIssue | "未検出";
+
 // 感度プリセット（厳しいほど早く検出される）
 type Sensitivity = "ゆるめ" | "普通" | "厳しめ";
 
@@ -84,6 +89,10 @@ const DEFAULT_SETTINGS: Settings = {
 
 // 崩れ状態が何ms続いたらアラートを出すか
 const ALERT_DELAY_MS = 5000;
+
+// 骨格が連続でこのms数だけ取れなかったら「未検出」とみなす
+// 一瞬の途切れ（逆光・腕で顔が隠れる等）でUIがちらつかないよう猶予を設ける
+const NO_LANDMARK_GRACE_MS = 1000;
 
 // ポモドーロの作業/休憩時間（ms）
 const POMODORO_WORK_MS = 25 * 60 * 1000;
@@ -249,8 +258,12 @@ export default function Home() {
   // 最後にアラートを出した時刻（ms）。nullは未発報。5秒ごとに繰り返すために使う
   const lastAlertTimeRef = useRef<number | null>(null);
 
+  // 骨格が取れなくなった最初の時刻（ms）。取れたらnullに戻す
+  // ここから NO_LANDMARK_GRACE_MS 経過したら status を「未検出」に切り替える
+  const noLandmarkStartRef = useRef<number | null>(null);
+
   // UI表示用のstate（毎フレームではなく状態が変わったときだけ更新）
-  const [status, setStatus] = useState<PostureIssue>("ok");
+  const [status, setStatus] = useState<Status>("ok");
   const [calibrated, setCalibrated] = useState<boolean>(false);
 
   // 設定state（UIで操作される）
@@ -636,6 +649,10 @@ export default function Home() {
 
         // 骨格描画（点だけシンプルに）
         if (landmarks) {
+          // 復帰：直前まで未検出だった場合は時計をクリアして判定を再開させる
+          // 骨格が戻った瞬間に handleIssue が走り、必要なら "未検出" → "ok"/"崩れ" に切り替わる
+          noLandmarkStartRef.current = null;
+
           landmarks.forEach((point) => {
             ctx.beginPath();
             ctx.arc(
@@ -655,6 +672,11 @@ export default function Home() {
             const issue = judgePosture(landmarks, baselineRef.current);
             handleIssue(issue);
           }
+        } else if (isStartedRef.current && baselineRef.current) {
+          // 骨格が取れていない & 監視中：未検出グレース計測
+          // 連続で NO_LANDMARK_GRACE_MS 続いたら "未検出" へ
+          // 一瞬の途切れ（顔を手で覆う等）で揺れないよう猶予を設けてある
+          handleNoLandmark();
         }
 
         // canvasが属するdocumentのwindowでrAFを呼ぶのが核心。
@@ -742,6 +764,30 @@ export default function Home() {
     if (m.earDist > base.earDist * t.ear) return "前のめり";
     if (m.shoulderDiff > base.shoulderDiff + t.shoulder) return "肩崩れ";
     return "ok";
+  };
+
+  // ── 骨格が取れていないときの処理（離席・カメラ前から外れる等）────
+  // 連続未検出が NO_LANDMARK_GRACE_MS を超えたら status を "未検出" にし、
+  // 崩れタイマー/アラート時計をリセットする（戻ったときにアラートが即発火しないように）
+  // 重要：動作時間カウントと履歴加算は landmarks がある時しか走らないので、
+  //       この関数内で明示的に止める必要は無い（自動的に一時停止する）
+  const handleNoLandmark = () => {
+    const now = performance.now();
+
+    // 未検出の開始時刻を記録（既に記録済みなら触らない）
+    if (noLandmarkStartRef.current === null) {
+      noLandmarkStartRef.current = now;
+      return;
+    }
+
+    const elapsed = now - noLandmarkStartRef.current;
+    if (elapsed < NO_LANDMARK_GRACE_MS) return;
+
+    // ここから先は「確定的に未検出」とみなすゾーン
+    // 崩れタイマー類をクリアして、戻ったときに OK スタートからやり直させる
+    issueStartRef.current = null;
+    lastAlertTimeRef.current = null;
+    setStatus((prev) => (prev === "未検出" ? prev : "未検出"));
   };
 
   // ── 崩れ状態の継続を時間で管理し、5秒ごとにアラートを繰り返す ────
@@ -887,6 +933,7 @@ export default function Home() {
     setStatus("ok");
     issueStartRef.current = null;
     lastAlertTimeRef.current = null;
+    noLandmarkStartRef.current = null;
     // PiPを閉じる処理は上のuseEffect（isStarted→false検知）が担当
   };
 
@@ -1102,11 +1149,14 @@ export default function Home() {
 
   // ── 派生値（UI表示）────────────────────────────────────
   // ステータスバッジの色
-  // ステータスバッジの色
-  // 優先順位: 未監視(カメラOFF) > 崩れ中 > 良好
+  // 優先順位: 未監視(カメラOFF) > 未検出(離席) > 崩れ中 > 良好
+  // 未検出は「判定不能」の中立を示すアンバーにする
+  // → 崩れ(赤)と混同せず、OK(緑)とも区別される
   const statusColor =
     !cameraActive
       ? "bg-slate-500/90"                  // グレー：カメラが止まっていて判定していない
+      : status === "未検出"
+      ? "bg-amber-500/90"                  // アンバー：骨格が取れていない（離席等）
       : status !== "ok"
       ? "bg-red-500/90 animate-pulse"      // 赤脈動：崩れ検出中
       : "bg-emerald-500/90";               // 緑：良好
@@ -1178,7 +1228,8 @@ export default function Home() {
                 : undefined
             }
             className={`relative inline-block rounded-2xl overflow-hidden border-4 bg-black shadow-2xl transition-colors duration-200 ${
-              calibrated && status !== "ok"
+              // 赤縁＋脈動は「崩れ確定」のときだけ。未検出(離席)では出さない
+              calibrated && status !== "ok" && status !== "未検出"
                 ? "border-red-500 ring-4 ring-red-500/40 animate-pulse"
                 : "border-white/10"
             }`}
@@ -1211,7 +1262,7 @@ export default function Home() {
               {!cameraActive
                 ? "状態: 未監視"
                 : calibrated
-                ? `状態: ${status === "ok" ? "良好" : status}`
+                ? `状態: ${status === "ok" ? "良好" : status === "未検出" ? "未検出（離席中？）" : status}`
                 : "未キャリブレーション"}
             </div>
 
@@ -1298,11 +1349,13 @@ export default function Home() {
                         ? "bg-slate-500"
                         : status === "ok"
                         ? "bg-emerald-400"
+                        : status === "未検出"
+                        ? "bg-amber-400"
                         : "bg-red-500 animate-pulse"
                     }`}
                   />
                   <span className="truncate font-medium">
-                    {!cameraActive ? "未監視" : calibrated ? (status === "ok" ? "姿勢OK" : status) : "未キャリブレーション"}
+                    {!cameraActive ? "未監視" : calibrated ? (status === "ok" ? "姿勢OK" : status === "未検出" ? "離席中?" : status) : "未キャリブレーション"}
                   </span>
                 </div>
                 <div className="flex gap-1 rounded-md bg-black/40 border border-white/10 p-0.5 text-[10px] shrink-0">
