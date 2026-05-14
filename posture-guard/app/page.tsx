@@ -39,7 +39,6 @@ type Settings = {
   notificationEnabled: boolean; // デスクトップ通知を出すか
   sensitivity: Sensitivity;     // 検出感度
   pomodoroEnabled: boolean;     // ポモドーロタイマーを使うか
-  autoPipEnabled: boolean;      // タブを離れたら自動でPiP小窓を開くか
   mosaicEnabled: boolean;       // 背景を自動でモザイク化するか（プライバシー保護）
 };
 
@@ -82,7 +81,6 @@ const DEFAULT_SETTINGS: Settings = {
   notificationEnabled: true,
   sensitivity: "普通",
   pomodoroEnabled: false,
-  autoPipEnabled: false,
   mosaicEnabled: false, // 初期は無効（処理コストがあるのでユーザー選択制）
 };
 
@@ -104,6 +102,7 @@ const PIP_MINIMIZED_SIZE = { width: 240, height: 50 };
 const LS_SETTINGS = "postureguard.settings.v1";
 const LS_STATS = "postureguard.stats.v1";       // 旧キー（移行用に読み込みのみ）
 const LS_HISTORY = "postureguard.history.v1";   // 新キー：日付ごとのDailyRecord
+const LS_BASELINE = "postureguard.baseline.v1"; // キャリブレーション基準値
 
 // 動作時間のフラッシュ間隔（refで貯めて、この間隔でstate/localStorageへ反映）
 const UPTIME_FLUSH_MS = 2000;
@@ -266,6 +265,8 @@ export default function Home() {
 
   // 履歴グラフの期間切替
   const [historyPeriod, setHistoryPeriod] = useState<Period>("30days");
+  // 履歴カードの折り畳み状態（デフォルト: 閉じた状態で設定を目立たせる）
+  const [historyOpen, setHistoryOpen] = useState<boolean>(false);
 
   // 動作時間トラッキング用
   // 前フレームの performance.now()。差分計算に使う
@@ -306,8 +307,10 @@ export default function Home() {
 
   // Document Picture-in-Picture：映像コンテナを丸ごと小窓に移動するために参照を持つ
   const videoContainerRef = useRef<HTMLDivElement>(null);
-  // PiPを閉じたときに「どこに戻すか」を覚えておくための元親要素
+  // PiPを閉じたときに「どこに戻すか」を覚えておくための元親要素と次の兄弟要素
+  // append()は末尾追加なので、insertBefore(container, nextSibling)で元の位置に戻す
   const originalParentRef = useRef<HTMLElement | null>(null);
+  const originalNextSiblingRef = useRef<ChildNode | null>(null);
   // PiPウィンドウのハンドル。開いていないときはnull
   const [pipWindow, setPipWindow] = useState<Window | null>(null);
   // PiP小窓のサイズモード（normal=映像表示 / minimized=細長い帯のみ）
@@ -320,17 +323,25 @@ export default function Home() {
   // ブラウザがDocument PiP APIをサポートしているか（マウント後に判定）
   const [pipSupported, setPipSupported] = useState<boolean>(false);
 
+  // 監視の開始/停止状態。trueの間だけ稼働時間計測・姿勢崩れ検知・PiP常駐が動く
+  const [isStarted, setIsStarted] = useState<boolean>(false);
+  const isStartedRef = useRef<boolean>(false);
+
   // マウント後にAPIの有無を判定（SSRでwindowが無いので初期値はfalse）
   useEffect(() => {
     setPipSupported(typeof window !== "undefined" && "documentPictureInPicture" in window);
   }, []);
 
   // ── containerInPipの最新値をrefにミラーする ────────────
-  // detectループ内のクロージャは初回マウント時の値を掴んでいるので、
-  // この同期が無いと「PiPに入ったのにモザイクが消えない」状態になる
   useEffect(() => {
     containerInPipRef.current = containerInPip;
   }, [containerInPip]);
+
+  // ── isStartedの最新値をrefにミラーする ──────────────────
+  // detectループのクロージャは古い値を掴むため、refで最新値を渡す
+  useEffect(() => {
+    isStartedRef.current = isStarted;
+  }, [isStarted]);
 
   // ── 初回マウント：localStorageから設定と統計を読む ───────
   useEffect(() => {
@@ -365,6 +376,18 @@ export default function Home() {
       }
     } catch {
       // 無視
+    }
+
+    // キャリブレーション基準値の復元
+    try {
+      const rawBaseline = localStorage.getItem(LS_BASELINE);
+      if (rawBaseline) {
+        const parsed = JSON.parse(rawBaseline) as Baseline;
+        baselineRef.current = parsed;
+        setCalibrated(true);
+      }
+    } catch {
+      // 壊れていたら無視
     }
 
     // 通知の許可状態を初期反映
@@ -595,7 +618,8 @@ export default function Home() {
         if (
           prevTs !== null &&
           baselineRef.current &&
-          landmarks
+          landmarks &&
+          isStartedRef.current
         ) {
           const dt = nowTs - prevTs;
           // 復帰直後などの巨大差分はガード（外れ値を弾く）
@@ -620,8 +644,8 @@ export default function Home() {
             ctx.fill();
           });
 
-          // 基準値があるなら毎フレーム判定
-          if (baselineRef.current) {
+          // スタート中かつ基準値があるなら毎フレーム判定
+          if (baselineRef.current && isStartedRef.current) {
             const issue = judgePosture(landmarks, baselineRef.current);
             handleIssue(issue);
           }
@@ -819,10 +843,18 @@ export default function Home() {
       return;
     }
 
-    baselineRef.current = computeMetrics(landmarks);
+    const baseline = computeMetrics(landmarks);
+    baselineRef.current = baseline;
     setCalibrated(true);
     issueStartRef.current = null;
     alertingRef.current = false;
+
+    // 再読み込み後も基準値を維持するためlocalStorageに保存
+    try {
+      localStorage.setItem(LS_BASELINE, JSON.stringify(baseline));
+    } catch {
+      // 容量超過等でも致命的ではない
+    }
 
     // 成功フィードバックを1.5秒表示
     setCalibrateFeedback("success");
@@ -833,6 +865,15 @@ export default function Home() {
 
     // 音設定がONなら短いビープで聴覚フィードバックも返す
     if (settingsRef.current.soundEnabled) playBeep();
+  };
+
+  // ── 監視停止ハンドラ ────────────────────────────────────────
+  const handleStop = () => {
+    setIsStarted(false);
+    setStatus("ok");
+    issueStartRef.current = null;
+    alertingRef.current = false;
+    // PiPを閉じる処理は上のuseEffect（isStarted→false検知）が担当
   };
 
   // ── Document Picture-in-Picture：小窓を開く ───────────────
@@ -903,6 +944,7 @@ export default function Home() {
 
     if (moveContent) {
       originalParentRef.current = videoContainerRef.current.parentElement;
+      originalNextSiblingRef.current = videoContainerRef.current.nextSibling;
       pip.document.body.append(videoContainerRef.current);
       setContainerInPip(true);
     } else {
@@ -918,7 +960,7 @@ export default function Home() {
     pip.addEventListener("pagehide", () => {
       const inPip = videoContainerRef.current && videoContainerRef.current.ownerDocument !== document;
       if (inPip && originalParentRef.current && videoContainerRef.current) {
-        originalParentRef.current.append(videoContainerRef.current);
+        originalParentRef.current.insertBefore(videoContainerRef.current, originalNextSiblingRef.current);
       }
       setPipWindow(null);
       setContainerInPip(false);
@@ -957,40 +999,35 @@ export default function Home() {
   // refを経由して常に最新版（最新のpipWindow参照を持つ版）を呼べるようにする
   resizePipRef.current = resizePip;
 
-  // ── 自動PiP（常駐モード）：PiPを閉じずにコンテナを行き来させる ───
-  // requestWindow が user gesture 起因しか許可しないブラウザ制約を回避するため、
-  // ON時に1度だけ最小化サイズでPiPを開いて常駐させ、以降は visibilitychange で
-  // 「コンテナの移動」と「resizeTo」だけ行う。
+  // ── 監視開始中のPiP常駐：スタート後にPiPを開き visibilitychange でコンテナを行き来させる ───
   useEffect(() => {
-    if (!settings.autoPipEnabled) return;
+    if (!isStarted) return;
     if (!pipSupported) return;
 
-    // 初期：PiPがまだなら最小化サイズで開く（コンテナはメインに留める）
+    // PiPがまだなら最小化サイズで開く（コンテナはメインに留める）
     if (!pipWindow) {
       openPip({ moveContent: false, initialSize: "minimized" }).catch((e) => {
-        console.warn("[AutoPiP] failed initial open (need user gesture):", e);
+        console.warn("[PiP] failed to open (need user gesture):", e);
       });
-      return; // PiPが開いたら pipWindow 依存で useEffect が再実行される
+      return; // pipWindowがセットされたら依存変化でuseEffectが再実行される
     }
 
     const onVisChange = () => {
       if (!pipWindow || !videoContainerRef.current) return;
-
-      // Chrome仕様：resizeToはvisibilitychange内では user activation不足で拒否される。
-      // サイズ変更は諦め、コンテナの移動とstate切替だけで「最小化」を表現する
       if (document.hidden) {
-        // タブ離脱：コンテナをPiPに移動 → 映像表示
+        // タブ離脱：コンテナをPiPに移動（復帰時に元位置へ戻せるよう兄弟も保存）
         removePipPlaceholder(pipWindow);
         if (videoContainerRef.current.ownerDocument === document) {
           originalParentRef.current = videoContainerRef.current.parentElement;
+          originalNextSiblingRef.current = videoContainerRef.current.nextSibling;
           pipWindow.document.body.append(videoContainerRef.current);
         }
         setPipSize("normal");
         setContainerInPip(true);
       } else {
-        // タブ復帰：コンテナをメインに戻す → PiPはプレースホルダだけになる
+        // タブ復帰：コンテナを元の位置に戻す（insertBeforeで順序を保持）
         if (videoContainerRef.current.ownerDocument !== document && originalParentRef.current) {
-          originalParentRef.current.append(videoContainerRef.current);
+          originalParentRef.current.insertBefore(videoContainerRef.current, originalNextSiblingRef.current);
         }
         setPipSize("minimized");
         setContainerInPip(false);
@@ -1001,7 +1038,15 @@ export default function Home() {
 
     document.addEventListener("visibilitychange", onVisChange);
     return () => document.removeEventListener("visibilitychange", onVisChange);
-  }, [settings.autoPipEnabled, pipSupported, pipWindow]);
+  }, [isStarted, pipSupported, pipWindow]);
+
+  // ── 監視停止時：PiPを閉じる ─────────────────────────────
+  // isStartedがfalseになったとき、またはPiPが開いた直後にStopが押された場合に対応
+  useEffect(() => {
+    if (!isStarted && pipWindow && !pipWindow.closed) {
+      pipWindow.close();
+    }
+  }, [isStarted, pipWindow]);
 
   // ── PiP内クリックのネイティブ委譲 ───────────────────────
   // React 18 の合成イベントシステムは createRoot した document にしか attach されない。
@@ -1242,15 +1287,34 @@ export default function Home() {
             )}
           </div>
 
+          {/* Start/Stop ボタン */}
+          <div className="flex justify-center pt-1">
+            {!isStarted ? (
+              <button
+                onClick={() => setIsStarted(true)}
+                className="px-10 py-3 rounded-full bg-gradient-to-r from-emerald-500 to-cyan-500 text-slate-900 font-bold text-base shadow-lg hover:opacity-90 active:scale-95 transition-transform"
+              >
+                ▶ 監視を開始
+              </button>
+            ) : (
+              <button
+                onClick={handleStop}
+                className="px-10 py-3 rounded-full bg-red-500/20 border border-red-500/40 text-red-400 font-bold text-base shadow-lg hover:bg-red-500/30 active:scale-95 transition"
+              >
+                ■ 監視を停止
+              </button>
+            )}
+          </div>
+
           {/* 使い方ヒント */}
           <div className="text-xs text-slate-400 px-1">
-            正しい姿勢で座って <span className="text-slate-200 font-semibold">「姿勢を記録」</span> を押すと基準が登録されます。崩れが5秒続くと通知されます。
+            正しい姿勢で座って <span className="text-slate-200 font-semibold">「姿勢を記録」</span> を押すと基準が登録されます。開始後、崩れが5秒続くと通知されます。
           </div>
         </section>
 
         {/* ── 右：サイドパネル ── */}
         <aside className="space-y-4">
-          {/* 統計カード：今日の崩れ（種類別表示は維持） */}
+          {/* ① 今日の崩れカード（常に表示） */}
           <div className="rounded-2xl border border-white/10 bg-white/5 p-5">
             <div className="flex items-center justify-between mb-3">
               <h2 className="font-bold">今日の崩れ</h2>
@@ -1288,93 +1352,7 @@ export default function Home() {
             </button>
           </div>
 
-          {/* 履歴カード：期間切替トグル + 棒グラフ + サマリ */}
-          <div className="rounded-2xl border border-white/10 bg-white/5 p-5">
-            <div className="flex items-center justify-between mb-3">
-              <h2 className="font-bold">履歴</h2>
-              <div className="flex gap-1 rounded-lg bg-black/30 p-0.5">
-                {(["7days", "30days", "90days", "all"] as Period[]).map((p) => (
-                  <button
-                    key={p}
-                    onClick={() => setHistoryPeriod(p)}
-                    className={`text-[10px] px-2 py-1 rounded-md transition ${
-                      historyPeriod === p
-                        ? "bg-white text-slate-900 font-bold"
-                        : "text-slate-300 hover:bg-white/10"
-                    }`}
-                  >
-                    {PERIOD_LABELS[p]}
-                  </button>
-                ))}
-              </div>
-            </div>
-
-            {/* サマリ：合計回数・動作時間・崩れ率 */}
-            <div className="grid grid-cols-3 gap-2 mb-3 text-center">
-              <div className="rounded-lg bg-black/30 p-2">
-                <div className="text-[10px] text-slate-400">合計</div>
-                <div className="font-bold text-slate-100 tabular-nums">
-                  {periodTotalCount}<span className="text-[10px] text-slate-400 ml-0.5">回</span>
-                </div>
-              </div>
-              <div className="rounded-lg bg-black/30 p-2">
-                <div className="text-[10px] text-slate-400">動作時間</div>
-                <div className="font-bold text-slate-100 tabular-nums">
-                  {formatHm(periodTotalHours * 3_600_000)}
-                </div>
-              </div>
-              <div className="rounded-lg bg-black/30 p-2">
-                <div className="text-[10px] text-slate-400">崩れ率</div>
-                <div className="font-bold text-slate-100 tabular-nums">
-                  {periodAvgRate.toFixed(1)}<span className="text-[10px] text-slate-400 ml-0.5">回/時</span>
-                </div>
-              </div>
-            </div>
-
-            {/* 棒グラフ：x=日付 / y=回数/時間（崩れ率）。0時間の日は0で表示 */}
-            <div className="w-full h-48">
-              {chartData.length === 0 ? (
-                <div className="h-full flex items-center justify-center text-xs text-slate-500">
-                  まだ履歴がありません
-                </div>
-              ) : (
-                <ResponsiveContainer width="100%" height="100%">
-                  <BarChart data={chartData} margin={{ top: 8, right: 8, left: -20, bottom: 0 }}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#ffffff10" />
-                    <XAxis
-                      dataKey="label"
-                      tick={{ fill: "#94a3b8", fontSize: 10 }}
-                      interval="preserveStartEnd"
-                    />
-                    <YAxis tick={{ fill: "#94a3b8", fontSize: 10 }} />
-                    <Tooltip
-                      contentStyle={{
-                        background: "#0f172a",
-                        border: "1px solid #334155",
-                        borderRadius: 8,
-                        fontSize: 12,
-                      }}
-                      labelStyle={{ color: "#e2e8f0" }}
-                      formatter={(value, _name, item) => {
-                        const row = (item as { payload?: ChartRow }).payload;
-                        if (!row) return [String(value), "回/時"];
-                        return [
-                          `${row.rate.toFixed(1)}回/時（合計${row.total}回 / ${formatHm(row.uptimeHours * 3_600_000)}）`,
-                          "崩れ率",
-                        ];
-                      }}
-                    />
-                    <Bar dataKey="rate" fill="#34d399" radius={[4, 4, 0, 0]} />
-                  </BarChart>
-                </ResponsiveContainer>
-              )}
-            </div>
-            <div className="mt-2 text-[10px] text-slate-500">
-              縦軸: 1時間あたりの崩れ回数（動作時間で正規化）
-            </div>
-          </div>
-
-          {/* 設定カード（backdrop-blur除去） */}
+          {/* ② 設定カード */}
           <div className="rounded-2xl border border-white/10 bg-white/5 p-5 space-y-3">
             <h2 className="font-bold mb-1">設定</h2>
 
@@ -1398,15 +1376,6 @@ export default function Home() {
               checked={settings.mosaicEnabled}
               onChange={(v) => setSettings((s) => ({ ...s, mosaicEnabled: v }))}
             />
-            {/* 自動PiPトグル：対応ブラウザのみ表示。disabled時は薄く見せる */}
-            {pipSupported && (
-              <ToggleRow
-                label="タブを離れたら自動で小窓化"
-                checked={settings.autoPipEnabled}
-                onChange={(v) => setSettings((s) => ({ ...s, autoPipEnabled: v }))}
-              />
-            )}
-
             <div className="pt-2">
               <div className="text-sm mb-2">検出感度</div>
               <div className="flex gap-1 rounded-lg bg-black/30 p-1">
@@ -1425,11 +1394,8 @@ export default function Home() {
                 ))}
               </div>
             </div>
-          </div>
-
-          {/* 通知の状態カード（backdrop-blur除去） */}
-          <div className="rounded-2xl border border-white/10 bg-white/5 p-5 text-sm">
-            <div className="flex items-center justify-between">
+            {/* 通知許可の状態インライン表示 */}
+            <div className="flex items-center justify-between pt-1 text-sm">
               <span className="text-slate-400">通知の許可</span>
               <span
                 className={`px-2 py-0.5 rounded-full text-xs ${
@@ -1440,13 +1406,115 @@ export default function Home() {
                     : "bg-slate-500/20 text-slate-300"
                 }`}
               >
-                {notifPermission === "granted"
-                  ? "許可済み"
-                  : notifPermission === "denied"
-                  ? "ブロック"
-                  : "未設定"}
+                {notifPermission === "granted" ? "許可済み" : notifPermission === "denied" ? "ブロック" : "未設定"}
               </span>
             </div>
+          </div>
+
+          {/* ③ 履歴カード（折り畳み式）
+              ヘッダー全体をボタンにして、クリックで open/close を切り替える */}
+          <div className="rounded-2xl border border-white/10 bg-white/5 overflow-hidden">
+            {/* 折り畳みヘッダー：▶ / ▼ で開閉状態を示す */}
+            <button
+              onClick={() => setHistoryOpen((prev) => !prev)}
+              className="w-full flex items-center justify-between px-5 py-4 hover:bg-white/5 transition text-left"
+            >
+              <h2 className="font-bold">履歴</h2>
+              {/* 三角を rotate で回す：closed=右向き(▶) / open=下向き(▼) */}
+              <span
+                className={`text-slate-400 transition-transform duration-200 ${
+                  historyOpen ? "rotate-90" : ""
+                }`}
+              >
+                ▶
+              </span>
+            </button>
+
+            {/* 折り畳みコンテンツ：historyOpen が true のときだけ表示 */}
+            {historyOpen && (
+              <div className="px-5 pb-5 space-y-3">
+                {/* 期間切替 */}
+                <div className="flex gap-1 rounded-lg bg-black/30 p-0.5">
+                  {(["7days", "30days", "90days", "all"] as Period[]).map((p) => (
+                    <button
+                      key={p}
+                      onClick={() => setHistoryPeriod(p)}
+                      className={`flex-1 text-[10px] px-2 py-1 rounded-md transition ${
+                        historyPeriod === p
+                          ? "bg-white text-slate-900 font-bold"
+                          : "text-slate-300 hover:bg-white/10"
+                      }`}
+                    >
+                      {PERIOD_LABELS[p]}
+                    </button>
+                  ))}
+                </div>
+
+                {/* サマリ */}
+                <div className="grid grid-cols-3 gap-2 text-center">
+                  <div className="rounded-lg bg-black/30 p-2">
+                    <div className="text-[10px] text-slate-400">合計</div>
+                    <div className="font-bold text-slate-100 tabular-nums">
+                      {periodTotalCount}<span className="text-[10px] text-slate-400 ml-0.5">回</span>
+                    </div>
+                  </div>
+                  <div className="rounded-lg bg-black/30 p-2">
+                    <div className="text-[10px] text-slate-400">動作時間</div>
+                    <div className="font-bold text-slate-100 tabular-nums">
+                      {formatHm(periodTotalHours * 3_600_000)}
+                    </div>
+                  </div>
+                  <div className="rounded-lg bg-black/30 p-2">
+                    <div className="text-[10px] text-slate-400">崩れ率</div>
+                    <div className="font-bold text-slate-100 tabular-nums">
+                      {periodAvgRate.toFixed(1)}<span className="text-[10px] text-slate-400 ml-0.5">回/時</span>
+                    </div>
+                  </div>
+                </div>
+
+                {/* 棒グラフ */}
+                <div className="w-full h-48">
+                  {chartData.length === 0 ? (
+                    <div className="h-full flex items-center justify-center text-xs text-slate-500">
+                      まだ履歴がありません
+                    </div>
+                  ) : (
+                    <ResponsiveContainer width="100%" height="100%">
+                      <BarChart data={chartData} margin={{ top: 8, right: 8, left: -20, bottom: 0 }}>
+                        <CartesianGrid strokeDasharray="3 3" stroke="#ffffff10" />
+                        <XAxis
+                          dataKey="label"
+                          tick={{ fill: "#94a3b8", fontSize: 10 }}
+                          interval="preserveStartEnd"
+                        />
+                        <YAxis tick={{ fill: "#94a3b8", fontSize: 10 }} />
+                        <Tooltip
+                          contentStyle={{
+                            background: "#0f172a",
+                            border: "1px solid #334155",
+                            borderRadius: 8,
+                            fontSize: 12,
+                          }}
+                          labelStyle={{ color: "#e2e8f0" }}
+                          formatter={(value, _name, item) => {
+                            const row = (item as { payload?: ChartRow }).payload;
+                            if (!row) return [String(value), "回/時"];
+                            return [
+                              `${row.rate.toFixed(1)}回/時（合計${row.total}回 / ${formatHm(row.uptimeHours * 3_600_000)}）`,
+                              "崩れ率",
+                            ];
+                          }}
+                        />
+                        <Bar dataKey="rate" fill="#34d399" radius={[4, 4, 0, 0]} />
+                      </BarChart>
+                    </ResponsiveContainer>
+                  )}
+                </div>
+                <div className="text-[10px] text-slate-500">
+                  縦軸: 1時間あたりの崩れ回数（動作時間で正規化）
+                </div>
+              </div>
+            )}
           </div>
         </aside>
       </main>
